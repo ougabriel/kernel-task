@@ -1,17 +1,14 @@
 
 # main.tf
-terraform {
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }
-  }
-}
+
+# Data Sources
+data "aws_availability_zones" "available" {}
 
 
 
-# VPC and Networking
+# 
+# VPC & Networking
+# 
 resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/16"
   enable_dns_hostnames = true
@@ -34,7 +31,28 @@ resource "aws_subnet" "private" {
   }
 }
 
+# 
 # Security Groups
+# 
+resource "aws_security_group" "app" {
+  name_prefix = "atlasco-app-"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
 resource "aws_security_group" "postgres" {
   name_prefix = "atlasco-postgres-"
   vpc_id      = aws_vpc.main.id
@@ -54,7 +72,28 @@ resource "aws_security_group" "postgres" {
   }
 }
 
-# RDS PostgreSQL
+resource "aws_security_group" "redshift" {
+  name_prefix = "atlasco-redshift-"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port       = 5439
+    to_port         = 5439
+    protocol        = "tcp"
+    security_groups = [aws_security_group.app.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# 
+# RDS Aurora PostgreSQL
+# 
 resource "aws_db_subnet_group" "postgres" {
   name       = "atlasco-postgres-${var.environment}"
   subnet_ids = aws_subnet.private[*].id
@@ -65,22 +104,19 @@ resource "aws_db_subnet_group" "postgres" {
 }
 
 resource "aws_rds_cluster" "postgres" {
-  cluster_identifier     = "atlasco-postgres-${var.environment}"
-  engine                = "aurora-postgresql"
-  engine_version        = "15.4"
-  database_name         = "atlasco"
-  master_username       = "atlasco_admin"
-  manage_master_user_password = true
-  
-  db_subnet_group_name   = aws_db_subnet_group.postgres.name
-  vpc_security_group_ids = [aws_security_group.postgres.id]
-  
-  backup_retention_period = var.environment == "prod" ? 7 : 1
-  preferred_backup_window = "03:00-04:00"
-  
+  cluster_identifier           = "atlasco-postgres-${var.environment}"
+  engine                       = "aurora-postgresql"
+  engine_version               = "15.4"
+  database_name                = "atlasco"
+  master_username              = "atlasco_admin"
+  manage_master_user_password  = true
+  db_subnet_group_name         = aws_db_subnet_group.postgres.name
+  vpc_security_group_ids       = [aws_security_group.postgres.id]
+
+  backup_retention_period      = var.environment == "prod" ? 7 : 1
+  preferred_backup_window      = "03:00-04:00"
   enabled_cloudwatch_logs_exports = ["postgresql"]
-  
-  # Performance and scaling settings
+
   serverlessv2_scaling_configuration {
     max_capacity = var.environment == "prod" ? 64 : 8
     min_capacity = var.environment == "prod" ? 8 : 0.5
@@ -91,24 +127,34 @@ resource "aws_rds_cluster" "postgres" {
   }
 }
 
+# 
 # Redshift Cluster
+
+resource "aws_redshift_subnet_group" "analytics" {
+  name       = "atlasco-redshift-subnets-${var.environment}"
+  subnet_ids = aws_subnet.private[*].id
+
+  tags = {
+    Name = "Atlasco Redshift subnet group"
+  }
+}
+
 resource "aws_redshift_cluster" "analytics" {
-  cluster_identifier = "atlasco-analytics-${var.environment}"
-  database_name      = "analytics"
-  master_username    = "atlasco_analytics"
-  manage_master_password = true
-  
-  node_type       = var.environment == "prod" ? "dc2.large" : "dc2.large"
+  cluster_identifier       = "atlasco-analytics-${var.environment}"
+  database_name            = "analytics"
+  master_username          = "atlasco_analytics"
+  manage_master_password   = true
+
+  node_type       = "dc2.large"
   number_of_nodes = var.environment == "prod" ? 3 : 1
-  
+
   cluster_subnet_group_name = aws_redshift_subnet_group.analytics.name
   vpc_security_group_ids    = [aws_security_group.redshift.id]
-  
+
   skip_final_snapshot = var.environment != "prod"
-  
+
   tags = {
     Environment = var.environment
   }
 }
-
 
