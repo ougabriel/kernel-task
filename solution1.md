@@ -1,10 +1,5 @@
 # Kernel Take-Home Complete Guide: EAV at Scale
 
-## Overview & Time Management
-- **Total Time**: 2 hours
-- **Part A**: 55-65 min (EAV Schema & Queries)
-- **Part B**: 30-35 min (Freshness & Replication)
-- **Part C**: 20-25 min (Infrastructure as Code)
 
 ## Part A: Data Model & Querying (55-65 minutes)
 
@@ -16,6 +11,10 @@
 - Multi-tenant system
 
 ### Step 2: Design the Core Schema (15 minutes)
+ this is a logical design for scalable, multi-tenant, flexible schemas.
+- Entity table: provides the core entity storage, tenant isolation wth tenant_id, type and timestamps.
+- Entity_attributes: implements the EAV model that wil help scale: partitioning by tenant_id, composite pk to enforce uniqueness at scale, as well as numeric_value
+   which allows pre-computed indecing/search for numbers there by helping to optimize queries.
 
 #### Logical Schema Design
 ```sql
@@ -54,7 +53,7 @@ CREATE TABLE attribute_metadata (
 );
 ```
 
-### Step 3: Partitioning Strategy (10 minutes)
+### Step 3: Partitioning Strategy 
 
 #### Multi-Level Partitioning Approach
 1. **Tenant-based Hash Partitioning**: Isolate tenants and distribute load
@@ -100,7 +99,7 @@ ON entity_attributes (tenant_id, attribute_value)
 WHERE attribute_name IN ('status', 'priority', 'region');
 ```
 
-### Step 5: Write Example Queries (15 minutes)
+### Step 5: Example Queries
 
 #### Operational Query (Multi-attribute Filter)
 ```sql
@@ -145,28 +144,79 @@ HAVING COUNT(*) > 1000
 ORDER BY entity_count DESC;
 ```
 
-## Part B: Read Freshness & Replication (30-35 minutes)
 
-### Step 6: Replication Architecture Design (15 minutes)
+###Summary 
+
+This design works very well when flexibility and tenant isolation are key. The EAV model allows to add attributes without schema changes, and the multi-level partitioning strategy (tenant hash, time ranges, and entity ID splits) keeps data distributed and manageable. Operational queries that filter on indexed attributes perform efficiently, especially when targeting hot data in recent partitions. Analytical queries also benefit from partition pruning and numeric indexing, making counts and averages on recent data feasible.
+
+The weaknesses appear when queries require joining many attributes, since the EAV model leads to join or grouping overhead. High-cardinality attributes can make indexes very large, and analytical workloads that need window functions or full scans degrade as the dataset grows. Hot partitions can also become a bottleneck if a tenant or time window attracts disproportionate load.
+
+If scale breaks, the system can fall back to denormalized or precomputed indexes for frequent filters, caching layers for repeated queries, and columnar or OLAP databases for large analytical workloads. For write or read hotspots, sub-partitioning and sharding tenants across nodes, or using streaming pipelines to absorb spikes, help maintain performance.
+
+## Part B: Read Freshness & Replication
+
+### Step 6: Replication Architecture Design
 
 #### Architecture Components
-```
-[OLTP Postgres] → [Logical Replication] → [Kafka] → [Stream Processor] → [OLAP Store]
-                                             ↓
-                                      [Real-time Cache]
-```
+
+Core Components
+
+OLTP: PostgreSQL Aurora cluster (primary + read replicas)
+OLAP: ClickHouse cluster (chosen over Redshift for real-time analytics)
+Streaming: Kafka + Kafka Connect with Debezium
+Cache Layer: Redis cluster for sub-second reads
+Stream Processing: Apache Flink for real-time aggregations
+
+#[OLTP Postgres] → [Logical Replication] → [Kafka] → [Stream Processor] → [OLAP Store]
+#                                             ↓
+#                                     [Real-time Cache]
+#
+
+┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
+│   Application   │───▶│  PostgreSQL      │───▶│ Logical Decode  │
+│     Layer       │    │   (Aurora)       │    │  (Debezium)     │
+└─────────────────┘    │                  │    └─────────────────┘
+         │              │  Primary + 2x    │             │
+         │              │  Read Replicas   │             │
+         │              └──────────────────┘             │
+         │                       │                       │
+         │              ┌──────────────────┐             │
+         └──────────────│  Read Replica    │             │
+                        │   (< 3s lag)     │             │
+                        └──────────────────┘             │
+                                                          │
+┌─────────────────┐    ┌──────────────────┐             │
+│  Redis Cluster  │◀───│  Apache Flink    │◀────────────┘
+│   (< 500ms)     │    │ Stream Processor │             │
+└─────────────────┘    └──────────────────┘             │
+         ▲                       │                       │
+         │                       │                       ▼
+         │                       ▼              ┌─────────────────┐
+┌─────────────────┐    ┌──────────────────┐    │  Kafka Cluster  │
+│   API Gateway   │    │   ClickHouse     │◀───│  (3 brokers)    │
+│ Freshness Logic │    │ (Analytics OLAP) │    │                 │
+└─────────────────┘    └──────────────────┘    └─────────────────┘
+                                │
+                       ┌──────────────────┐
+                       │  Materialized    │
+                       │     Views        │
+                       │ (5min - 1hr lag) │
+                       └──────────────────┘
 
 #### Freshness Budget Matrix
-| Query Type | Freshness Requirement | Data Source | Max Lag |
-|------------|----------------------|-------------|---------|
-| User Dashboard | Immediate (< 1s) | OLTP Primary + Cache | 0-1s |
-| Alert Queries | Near Real-time | OLTP Read Replica | 1-5s |
-| Operational Reports | Recent (< 30s) | Kafka Stream | 5-30s |
-| Analytics Queries | Eventually Consistent | OLAP Store | 1-15 min |
-| Historical Analysis | Batch Consistent | OLAP Store | 1-24 hours |
 
-### Step 7: Implementation Details (10 minutes)
+| Query Type            | Use Case                     | Freshness SLA | Data Source  | Max Lag     | Fallback Strategy                 |
+| --------------------- | ---------------------------- | ------------- | ------------ | ----------- | --------------------------------- |
+| Critical User Actions | Asset status updates, alerts | < 1 second    | OLTP Primary | 0–500 ms    | Synchronous write + cache         |
+| Dashboard Queries     | Real-time asset monitoring   | < 5 seconds   | Redis Cache  | 0.5–3 s     | Read replica if cache miss        |
+| Operational Queries   | Multi-attribute filtering    | < 10 seconds  | Read Replica | 1–5 s       | Query primary if replica lag > 5s |
+| Alert Evaluation      | Threshold monitoring         | < 30 seconds  | Flink Stream | 5–15 s      | Cached aggregates                 |
+| Reporting Queries     | Hourly/daily reports         | < 5 minutes   | ClickHouse   | 1–5 min     | Pre-computed materialized views   |
+| Analytics Queries     | Business intelligence        | < 30 minutes  | ClickHouse   | 5–30 min    | Batch-computed aggregates         |
+| Historical Analysis   | Trend analysis, ML training  | < 2 hours     | ClickHouse   | 30 min–2 hr | Data lake backup                  |
+| Compliance Reports    | Audit trails, compliance     | Best effort   | Data Lake    | 2–24 hr     | Archive storage                   |
 
+### Step 7: Implementation Details
 #### Replication Flow
 ```yaml
 # Logical Replication Setup
@@ -186,43 +236,155 @@ debezium:
 ```
 
 #### Freshness Detection
-```python
+```
 # API Response Headers
+HTTP/1.1 200 OK
+Content-Type: application/json
+X-Data-Freshness: near-realtime
+X-Data-Lag-Seconds: 2.3
+X-Data-Source: read-replica
+X-Query-Timestamp: 2024-01-15T14:30:45.123Z
+X-Replication-Lag: 1.8
+X-Cache-Hit: false
+X-Freshness-Tier: NEAR_REALTIME
+X-SLA-Met: true
+
 {
-    "X-Data-Freshness": "realtime",  # realtime, near-realtime, eventual
-    "X-Data-Lag-Seconds": "0.5",
-    "X-Data-Source": "primary",       # primary, replica, cache, olap
-    "X-Query-Timestamp": "2024-01-15T10:30:00Z"
+  "entities": [...],
+  "metadata": {
+    "total_count": 1247,
+    "freshness": {
+      "tier": "NEAR_REALTIME",
+      "lag_seconds": 2.3,
+      "source": "read-replica",
+      "sla_target": 10,
+      "sla_met": true
+    }
+  }
 }
 ```
 
-### Step 8: ASCII Diagram (5 minutes)
+### Step 8: ASCII Diagram
 
 ```
-┌─────────────┐    ┌──────────────┐    ┌─────────────┐    ┌──────────────┐
-│   App/API   │───▶│ OLTP Primary │───▶│   Logical   │───▶│    Kafka     │
-└─────────────┘    │  (Postgres)  │    │ Replication │    │   Topics     │
-       │           └──────────────┘    └─────────────┘    └──────────────┘
-       │                    │                                      │
-       │           ┌──────────────┐                                │
-       └───────────│ Read Replica │                                │
-                   │  (< 5s lag)  │                                │
-                   └──────────────┘                                │
-                                                                   │
-┌─────────────┐    ┌──────────────┐    ┌─────────────┐            │
-│   Redis     │◀───│ Stream Proc. │◀───│   Kafka     │◀───────────┘
-│   Cache     │    │  (Flink)     │    │  Consumer   │
-└─────────────┘    └──────────────┘    └─────────────┘
-                            │
-                   ┌──────────────┐
-                   │    OLAP      │
-                   │ (ClickHouse) │
-                   └──────────────┘
+┌─ LAG DETECTION POINTS ─┐
+                              │                        │
+                              │ ①  ②   ③      ④    ⑤ │
+                              └────────────────────────┘
+
+┌─────────────────┐    [①]   ┌──────────────────┐    [②]   ┌─────────────────┐
+│   Application   │──────────▶│  PostgreSQL      │──────────▶│ Logical Decode  │
+│     Layer       │ Write     │   (Aurora)       │ WAL      │  (Debezium)     │
+│                 │ Confirm   │                  │ Stream   │                 │
+│ ┌─────────────┐ │           │  Primary + 2x    │          └─────────────────┘
+│ │ Freshness   │ │           │  Read Replicas   │                    │
+│ │ Router      │ │           └──────────────────┘                    │
+│ └─────────────┘ │                    │                              │
+│       │         │           [③]      │                              │
+│       │         │   ┌──────────────────┐         [④]               │
+│       │         └───│  Read Replica    │◀─────────────────┬─────────┘
+│       │             │   Lag: 0.8s      │ Heartbeat        │
+│       │             └──────────────────┘ Monitor          │
+│       │                      │                           │
+│       │                      │                           ▼
+│       │             ┌──────────────────┐         ┌─────────────────┐
+│       │             │  Lag Monitor     │         │  Kafka Cluster  │
+│       │             │  Dashboard       │         │  (3 brokers)    │
+│       │             └──────────────────┘         │                 │
+│       │                                          │ Topic: entities │
+│       │                                          └─────────────────┘
+│       │                                                   │
+│       │             ┌──────────────────┐                 │
+│       └─────────────│  Redis Cluster   │◀────────────────┤
+│      Cache          │   Lag: 0.3s      │ Stream          │
+│      Fallback       │                  │ Process         │
+│                     └──────────────────┘ (Hot Path)      │
+│                              ▲                           │
+│                              │          [⑤]             │
+│                              │ ┌──────────────────┐     │
+└──────────────────────────────┼─│  Apache Flink    │◀────┤
+       Query Route             │ │ Stream Processor │     │
+       Decision                │ │ Lag: 2.1s        │     │
+                               │ └──────────────────┘     │
+                               │          │               │
+                               │          │               │
+┌─────────────────┐            │          ▼               │
+│   Alerting      │            │ ┌──────────────────┐     │
+│   System        │◀───────────┘ │   ClickHouse     │◀────┘
+│                 │              │ (Analytics OLAP) │ Stream
+│ • Lag > 30s     │              │ Lag: 45s         │ Process
+│ • SLA Breach    │              └──────────────────┘ (Cold Path)
+│ • Source Down   │                       │
+└─────────────────┘                       │
+                                          ▼
+                                 ┌──────────────────┐
+                                 │  Materialized    │
+                                 │     Views        │
+                                 │ Lag: 5min-1hr    │
+                                 └──────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════
+
+LAG DETECTION & HANDLING FLOW:
+
+① PRIMARY WRITE LAG (0-100ms)
+  │ 
+  ├─ INSERT heartbeat(id, timestamp)
+  └─ Measure: write_confirm_time - request_time
+
+② WAL DECODE LAG (100ms-2s)  
+  │
+  ├─ Monitor: pg_stat_replication.replay_lag
+  └─ Alert if > 5s
+
+③ REPLICA LAG (0.5s-10s)
+  │
+  ├─ SELECT heartbeat WHERE id=X (every 5s)
+  └─ Measure: found_time - inserted_time
+  
+④ KAFKA LAG (1s-30s)
+  │
+  ├─ Monitor: kafka_consumer_lag_seconds metric
+  └─ Circuit breaker if lag > 60s
+
+⑤ STREAM PROCESSING LAG (2s-60s)
+  │
+  ├─ Flink watermarks + event time processing
+  └─ Measure: processing_time - event_timestamp
+
+ROUTING DECISION TREE:
+┌─ Query arrives with freshness requirement
+│
+├─ REALTIME (<1s): 
+│  ├─ Primary available? → Primary
+│  ├─ Cache fresh (<5s)? → Redis  
+│  └─ Else → Primary (force)
+│
+├─ NEAR_REALTIME (<10s):
+│  ├─ Replica lag <5s? → Replica
+│  ├─ Cache fresh? → Redis
+│  └─ Else → Primary
+│
+└─ EVENTUAL (>10s):
+   ├─ ClickHouse lag <60s? → ClickHouse
+   └─ Else → Replica
+
+FAILURE HANDLING:
+┌─ Source Unavailable ─┐    ┌─ High Lag Detected ─┐
+│                      │    │                     │
+│ Primary Down         │    │ Replica lag > 10s   │
+│ ├─ Route to Replica  │    │ ├─ Route to Primary │
+│ └─ Alert Ops         │    │ └─ Update SLA       │
+│                      │    │                     │
+│ Replica Down         │    │ Kafka lag > 60s     │
+│ ├─ Route to Primary  │    │ ├─ Circuit Breaker  │
+│ └─ Scale up          │    │ └─ Route to Replica │
+└──────────────────────┘    └─────────────────────┘
 ```
 
-## Part C: Infrastructure as Code (20-25 minutes)
+## Part C: Infrastructure as Code 
 
-### Step 9: Terraform Implementation (20 minutes)
+### Step 9: Terraform Implementation
 
 ```hcl
 # variables.tf
@@ -371,7 +533,7 @@ locals {
 }
 ```
 
-### Step 10: Final Deliverables Structure (5 minutes)
+### Step 10: Final Deliverables Structure
 
 ```
 kernel-takehome/
@@ -400,21 +562,4 @@ kernel-takehome/
 - **Environment Parameterization**: Different instance sizes, backup policies
 - **Cost Optimization**: Serverless scaling, reserved instances for prod
 
-## Time-Saving Tips
 
-1. **Focus on the core requirements** - don't over-engineer
-2. **Use proven patterns** - EAV with GIN indexes, logical replication
-3. **Be explicit about trade-offs** - they want to see your judgment
-4. **Keep IaC simple but realistic** - show structure, not every detail
-5. **Document assumptions** - tenancy model, data retention, etc.
-
-## Final Checklist
-
-- [ ] Schema handles 200M entities efficiently
-- [ ] Partitioning strategy explained
-- [ ] Both operational and analytical queries provided
-- [ ] Freshness matrix completed
-- [ ] Replication architecture documented
-- [ ] Terraform code is parameterized
-- [ ] Trade-offs explicitly called out
-- [ ] TODOs documented in notes.md
