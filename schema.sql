@@ -29,3 +29,6 @@ CREATE TABLE entity_attribute (
   PRIMARY KEY (attribute_id, entity_id)  -- narrow PK useful for partitions & lookups
 ) PARTITION BY HASH (attribute_id);
 
+
+
+
