@@ -1,3 +1,5 @@
+###Proposed Logical schema
+
 -- metadata for attributes
 CREATE TABLE attr_type (
   attribute_id    integer PRIMARY KEY,   -- small int or int
