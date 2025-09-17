@@ -1,9 +1,9 @@
 # variables.tf
 variable "environment" {
-  description = "Environment name"
   type        = string
-  default     = "dev"
+  description = "Deployment environment (dev, prod, etc.)"
 }
+
 
 variable "postgres_instance_class" {
   description = "RDS instance class"
