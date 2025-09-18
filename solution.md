@@ -29,7 +29,7 @@ kernel-task/
    which allows pre-computed indecing/search for numbers there by helping to optimize queries.
 
 #### Logical Schema Design
-Please CLICK HERE for the actual schema design
+Please [CLICK HERE](https://github.com/ougabriel/kernel-task/blob/main/schema.sql) for the actual schema design
 
 ---
 
