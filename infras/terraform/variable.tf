@@ -1,12 +1,19 @@
 # variables.tf
+
 variable "environment" {
+  description = "Deployment environment (e.g. dev, staging, prod)"
   type        = string
-  description = "Deployment environment (dev, prod, etc.)"
+  default     = "dev"
 }
 
-
-variable "postgres_instance_class" {
-  description = "RDS instance class"
+variable "aws_region" {
+  description = "AWS region to deploy resources in"
   type        = string
-  default     = "db.r6g.xlarge"
+  default     = "us-east-1"
+}
+
+variable "aws_profile" {
+  description = "AWS CLI profile name to use for authentication"
+  type        = string
+  default     = "default"
 }
