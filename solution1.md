@@ -1,5 +1,17 @@
 # Kernel Take-Home Complete Guide: EAV at Scale
-
+Complete Dirs Structure
+kernel-task/
+├── solution.md
+├── schema.sql
+├── infras/terraform
+│   ├── variables.tf      # Input variables and validation
+│   ├── locals.tf         # Computed values and environment configs
+│   ├── provider.tf       # Terraform and AWS provider configuration
+│   ├── main.tf           # Core infrastructure resources
+│   ├── outputs.tf        # Output values for other modules/scripts
+│   ├── terraform.tfvars.example  # Example variable values
+│   └── README.md         # Infrastructure documentation
+└── notes.md
 
 ## Part A: Data Model & Querying
 
@@ -639,6 +651,15 @@ alerts:
 
 This architecture provides clear data freshness boundaries with automatic fallback strategies, comprehensive monitoring, and explicit client contracts for different use cases.
 ## Part C: Infrastructure as Code 
+Dir structure for terraform deployment
+infras/terraform/
+      ├── main.tf
+      ├── variables.tf
+      ├── locals.tf
+      ├── outputs.tf
+      ├── dev.tfvars
+      ├── prod.tfvars
+
 
 ### Step 9: Terraform Implementation
 Please check here for the terraform, main.tf, variable.tf, output.tf scripts
@@ -647,15 +668,488 @@ Please check here for the terraform, main.tf, variable.tf, output.tf scripts
 ### Step 10: Final Deliverables Structure
 
 ```
-kernel-takehome/
-├── solution1.md          # Main design document
-├── schema.sql          # PostgreSQL DDL and queries
-├── infra/
-│   ├── main.tf
-│   ├── variables.tf
-│   └── outputs.tf
+kernel-tasks/
+├── solution.md
+├── schema.sql
+├── infras/terraform
+│   ├── variables.tf      # Input variables and validation
+│   ├── locals.tf         # Computed values and environment configs
+│   ├── provider.tf       # Terraform and AWS provider configuration
+│   ├── main.tf           # Core infrastructure resources
+│   ├── outputs.tf        # Output values for other modules/scripts
+│   ├── terraform.tfvars.example  # Example variable values
+│   └── README.md         # Infrastructure documentation
+└── notes.md
 
 ```
+Example Usage of the `terraform` script.
+```tf
+   
+   # Deploy development environment
+   terraform init
+   terraform plan -var="environment=dev"
+   terraform apply -var="environment=dev"
+   
+   # Deploy production environment
+   terraform plan -var="environment=prod"
+   terraform apply -var="environment=prod"
+```
+
+##Additional Example using Modules
+In this example I will attempt to restructure the Terraform setup into **reusable modules** — this is the recommended approach for production-ready IaC.
+
+---
+
+## Directory structure (modular)
+
+```
+terraform/
+├── main.tf
+├── variables.tf
+├── locals.tf
+├── outputs.tf
+├── dev.tfvars
+├── prod.tfvars
+└── modules/
+    ├── vpc/
+    │   ├── main.tf
+    │   ├── variables.tf
+    │   └── outputs.tf
+    ├── rds_aurora/
+    │   ├── main.tf
+    │   ├── variables.tf
+    │   └── outputs.tf
+    └── redshift/
+        ├── main.tf
+        ├── variables.tf
+        └── outputs.tf
+```
+
+---
+
+## 1️ modules/vpc/main.tf
+
+```hcl
+resource "aws_vpc" "this" {
+  cidr_block           = var.cidr_block
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+
+  tags = merge(var.common_tags, { Name = "${var.name_prefix}-vpc" })
+}
+
+resource "aws_subnet" "private" {
+  count             = length(var.azs)
+  vpc_id            = aws_vpc.this.id
+  cidr_block        = "10.0.${count.index + 1}.0/24"
+  availability_zone = var.azs[count.index]
+
+  tags = merge(var.common_tags, { Name = "${var.name_prefix}-private-${count.index + 1}" })
+}
+
+resource "aws_security_group" "app" {
+  name_prefix = "${var.name_prefix}-app-"
+  vpc_id      = aws_vpc.this.id
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = var.common_tags
+}
+
+resource "aws_security_group" "postgres" {
+  name_prefix = "${var.name_prefix}-postgres-"
+  vpc_id      = aws_vpc.this.id
+
+  ingress {
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.app.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = var.common_tags
+}
+
+resource "aws_security_group" "redshift" {
+  name_prefix = "${var.name_prefix}-redshift-"
+  vpc_id      = aws_vpc.this.id
+
+  ingress {
+    from_port       = 5439
+    to_port         = 5439
+    protocol        = "tcp"
+    security_groups = [aws_security_group.app.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = var.common_tags
+}
+```
+
+---
+
+### modules/vpc/variables.tf
+
+```hcl
+variable "name_prefix" {
+  type = string
+}
+
+variable "common_tags" {
+  type = map(string)
+}
+
+variable "cidr_block" {
+  type    = string
+  default = "10.0.0.0/16"
+}
+
+variable "azs" {
+  type = list(string)
+}
+```
+
+---
+
+### modules/vpc/outputs.tf
+
+```hcl
+output "vpc_id" {
+  value = aws_vpc.this.id
+}
+
+output "private_subnet_ids" {
+  value = aws_subnet.private[*].id
+}
+
+output "sg_app_id" {
+  value = aws_security_group.app.id
+}
+
+output "sg_postgres_id" {
+  value = aws_security_group.postgres.id
+}
+
+output "sg_redshift_id" {
+  value = aws_security_group.redshift.id
+}
+```
+
+---
+
+## 2️ modules/rds\_aurora/main.tf
+
+```hcl
+resource "aws_db_subnet_group" "postgres" {
+  name       = "${var.name_prefix}-postgres-subnets"
+  subnet_ids = var.subnet_ids
+  tags       = var.common_tags
+}
+
+resource "aws_rds_cluster" "postgres" {
+  cluster_identifier          = "${var.name_prefix}-postgres"
+  engine                      = "aurora-postgresql"
+  engine_version              = "15.4"
+  database_name               = "atlasco"
+  master_username             = var.master_username
+  manage_master_user_password = true
+  db_subnet_group_name        = aws_db_subnet_group.postgres.name
+  vpc_security_group_ids      = [var.sg_postgres_id]
+
+  backup_retention_period       = var.backup_retention_period
+  preferred_backup_window       = "03:00-04:00"
+  enabled_cloudwatch_logs_exports = ["postgresql"]
+
+  serverlessv2_scaling_configuration {
+    max_capacity = var.max_capacity
+    min_capacity = var.min_capacity
+  }
+
+  tags = var.common_tags
+}
+```
+
+---
+
+### modules/rds\_aurora/variables.tf
+
+```hcl
+variable "name_prefix" {
+  type = string
+}
+
+variable "common_tags" {
+  type = map(string)
+}
+
+variable "subnet_ids" {
+  type = list(string)
+}
+
+variable "sg_postgres_id" {
+  type = string
+}
+
+variable "master_username" {
+  type    = string
+  default = "atlasco_admin"
+}
+
+variable "backup_retention_period" {
+  type    = number
+  default = 1
+}
+
+variable "max_capacity" {
+  type = number
+  default = 8
+}
+
+variable "min_capacity" {
+  type = number
+  default = 0.5
+}
+```
+
+---
+
+### modules/rds\_aurora/outputs.tf
+
+```hcl
+output "rds_endpoint" {
+  value = aws_rds_cluster.postgres.endpoint
+}
+```
+
+---
+
+## 3️ modules/redshift/main.tf
+
+```hcl
+resource "aws_redshift_subnet_group" "analytics" {
+  name       = "${var.name_prefix}-redshift-subnets"
+  subnet_ids = var.subnet_ids
+  tags       = var.common_tags
+}
+
+resource "aws_redshift_cluster" "analytics" {
+  cluster_identifier       = "${var.name_prefix}-analytics"
+  database_name            = "analytics"
+  master_username          = var.master_username
+  manage_master_password   = true
+
+  node_type       = var.node_type
+  number_of_nodes = var.number_of_nodes
+
+  cluster_subnet_group_name = aws_redshift_subnet_group.analytics.name
+  vpc_security_group_ids    = [var.sg_redshift_id]
+
+  skip_final_snapshot = var.skip_final_snapshot
+
+  tags = var.common_tags
+}
+```
+
+---
+
+### modules/redshift/variables.tf
+
+```hcl
+variable "name_prefix" {
+  type = string
+}
+
+variable "common_tags" {
+  type = map(string)
+}
+
+variable "subnet_ids" {
+  type = list(string)
+}
+
+variable "sg_redshift_id" {
+  type = string
+}
+
+variable "master_username" {
+  type    = string
+  default = "atlasco_analytics"
+}
+
+variable "node_type" {
+  type = string
+}
+
+variable "number_of_nodes" {
+  type = number
+}
+
+variable "skip_final_snapshot" {
+  type    = bool
+  default = true
+}
+```
+
+---
+
+### modules/redshift/outputs.tf
+
+```hcl
+output "redshift_endpoint" {
+  value = aws_redshift_cluster.analytics.endpoint
+}
+```
+
+---
+
+## 4️ main.tf (root module)
+
+```hcl
+provider "aws" {
+  region  = var.aws_region
+  profile = var.aws_profile
+}
+
+data "aws_availability_zones" "available" {}
+
+#########################
+# VPC module
+#########################
+module "vpc" {
+  source       = "./modules/vpc"
+  name_prefix  = local.name_prefix
+  common_tags  = local.common_tags
+  azs          = data.aws_availability_zones.available.names
+}
+
+#########################
+# RDS Aurora module
+#########################
+module "rds_aurora" {
+  source                  = "./modules/rds_aurora"
+  name_prefix             = local.name_prefix
+  common_tags             = local.common_tags
+  subnet_ids              = module.vpc.private_subnet_ids
+  sg_postgres_id          = module.vpc.sg_postgres_id
+  backup_retention_period = var.environment == "prod" ? 7 : 1
+  max_capacity            = var.environment == "prod" ? 64 : 8
+  min_capacity            = var.environment == "prod" ? 8 : 0.5
+}
+
+#########################
+# Redshift module
+#########################
+module "redshift" {
+  source             = "./modules/redshift"
+  name_prefix        = local.name_prefix
+  common_tags        = local.common_tags
+  subnet_ids         = module.vpc.private_subnet_ids
+  sg_redshift_id     = module.vpc.sg_redshift_id
+  node_type          = local.env_configs[var.environment].redshift_node_type
+  number_of_nodes    = local.env_configs[var.environment].redshift_number_of_nodes
+  skip_final_snapshot = var.environment != "prod"
+}
+```
+
+---
+
+## 5️ outputs.tf (root)
+
+```hcl
+output "vpc_id" {
+  value = module.vpc.vpc_id
+}
+
+output "private_subnet_ids" {
+  value = module.vpc.private_subnet_ids
+}
+
+output "rds_endpoint" {
+  value = module.rds_aurora.rds_endpoint
+}
+
+output "redshift_endpoint" {
+  value = module.redshift.redshift_endpoint
+}
+```
+
+---
+
+## 6 dev.tfvars
+
+```hcl
+environment = "dev"
+aws_region  = "us-east-1"
+aws_profile = "default"
+```
+
+---
+
+## 7 prod.tfvars
+
+```hcl
+environment = "prod"
+aws_region  = "us-east-1"
+aws_profile = "default"
+```
+
+---
+
+### ✅ How to run
+
+```bash
+terraform init
+terraform plan -var-file=dev.tfvars
+terraform apply -var-file=dev.tfvars
+
+terraform plan -var-file=prod.tfvars
+terraform apply -var-file=prod.tfvars
+```
+
+---
+
+This modular approach allows us to:
+
+* Reuse **VPC**, **RDS**, and **Redshift** modules across multiple environments.
+* Keep **environment-specific configs** centralized in `locals.tf`.
+* Keep **root `main.tf`** clean and readable.
+
+---
+
+
+
+## Key Benefits of This Structure:
+
+i. Separation of Concerns: Each file has a specific purpose
+ii. Environment Parameterization: Easy switching between dev/staging/prod
+iii. Reusable: Can be used across multiple projects with variable changes
+iv. Production Ready: Includes proper tagging, security groups, and encryption
+v. Maintainable: Clear organization makes it easy for teams to collaborate
 
 ## Key Trade-offs to Address
 
