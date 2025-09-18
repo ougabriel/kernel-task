@@ -1,54 +1,12 @@
-# main.tf - Atlas Telemetry Platform Infrastructure
-# Provisions Aurora PostgreSQL + Redshift + VPC for high-scale OLTP/OLAP workloads
-
-terraform {
-  required_version = ">= 1.0"
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }
-  }
-}
-
-provider "aws" {
-  region = var.aws_region
-  
-  default_tags {
-    tags = var.common_tags
-  }
-}
-
-# Data sources
-data "aws_availability_zones" "available" {
-  state = "available"
-}
-
-data "aws_caller_identity" "current" {}
-
-# Local values for environment-specific configuration
-locals {
-  # Subnet CIDR calculations
-  private_subnet_cidrs = [for i in range(3) : cidrsubnet(var.vpc_cidr, 4, i + 1)]
-  public_subnet_cidrs  = [for i in range(2) : cidrsubnet(var.vpc_cidr, 4, i + 10)]
-  
-  # Environment-specific settings
-  is_production = var.environment == "prod"
-  nat_gateway_count = local.is_production ? 2 : 1
-  
-  # Resource naming
-  name_prefix = "${var.project_name}-${var.environment}"
-}
-
-#------------------------------------------------------------------------------
-# VPC and Networking
-#------------------------------------------------------------------------------
+# ============================================================================
+# VPC AND NETWORKING
+# ============================================================================
 
 resource "aws_vpc" "main" {
-  cidr_block           = var.vpc_cidr
+  cidr_block           = local.vpc_cidr
   enable_dns_hostnames = true
   enable_dns_support   = true
-  
+
   tags = {
     Name = "${local.name_prefix}-vpc"
   }
@@ -56,356 +14,377 @@ resource "aws_vpc" "main" {
 
 resource "aws_internet_gateway" "main" {
   vpc_id = aws_vpc.main.id
-  
+
   tags = {
     Name = "${local.name_prefix}-igw"
   }
 }
 
-# Private subnets for databases (multi-AZ)
-resource "aws_subnet" "private" {
-  count = 3
-  
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = local.private_subnet_cidrs[count.index]
-  availability_zone = data.aws_availability_zones.available.names[count.index]
-  
-  tags = {
-    Name = "${local.name_prefix}-private-subnet-${count.index + 1}"
-    Type = "private"
-  }
-}
-
 # Public subnets for NAT gateways
 resource "aws_subnet" "public" {
-  count = 2
+  count             = 2
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = cidrsubnet(local.vpc_cidr, 8, count.index)
+  availability_zone = data.aws_availability_zones.available.names[count.index]
   
-  vpc_id                  = aws_vpc.main.id
-  cidr_block              = local.public_subnet_cidrs[count.index]
-  availability_zone       = data.aws_availability_zones.available.names[count.index]
   map_public_ip_on_launch = true
-  
+
   tags = {
-    Name = "${local.name_prefix}-public-subnet-${count.index + 1}"
+    Name = "${local.name_prefix}-public-${count.index + 1}"
     Type = "public"
   }
 }
 
-# Elastic IPs for NAT gateways
-resource "aws_eip" "nat" {
-  count  = local.nat_gateway_count
-  domain = "vpc"
-  
-  depends_on = [aws_internet_gateway.main]
-  
+# Private subnets for databases
+resource "aws_subnet" "private" {
+  count             = 3
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = cidrsubnet(local.vpc_cidr, 8, count.index + 10)
+  availability_zone = data.aws_availability_zones.available.names[count.index]
+
   tags = {
-    Name = "${local.name_prefix}-nat-eip-${count.index + 1}"
+    Name = "${local.name_prefix}-private-${count.index + 1}"
+    Type = "private"
   }
 }
 
-# NAT gateways for outbound connectivity
-resource "aws_nat_gateway" "main" {
-  count = local.nat_gateway_count
-  
-  allocation_id = aws_eip.nat[count.index].id
-  subnet_id     = aws_subnet.public[count.index].id
-  
-  depends_on = [aws_internet_gateway.main]
-  
+# NAT Gateway for outbound internet access from private subnets
+resource "aws_eip" "nat" {
+  count  = local.config.enable_nat_gateway ? 1 : 0
+  domain = "vpc"
+
   tags = {
-    Name = "${local.name_prefix}-nat-${count.index + 1}"
+    Name = "${local.name_prefix}-nat-eip"
   }
+}
+
+resource "aws_nat_gateway" "main" {
+  count         = local.config.enable_nat_gateway ? 1 : 0
+  allocation_id = aws_eip.nat[0].id
+  subnet_id     = aws_subnet.public[0].id
+
+  tags = {
+    Name = "${local.name_prefix}-nat"
+  }
+
+  depends_on = [aws_internet_gateway.main]
 }
 
 # Route tables
 resource "aws_route_table" "public" {
   vpc_id = aws_vpc.main.id
-  
+
   route {
     cidr_block = "0.0.0.0/0"
     gateway_id = aws_internet_gateway.main.id
   }
-  
+
   tags = {
     Name = "${local.name_prefix}-public-rt"
   }
 }
 
 resource "aws_route_table" "private" {
-  count  = local.nat_gateway_count
+  count  = local.config.enable_nat_gateway ? 1 : 0
   vpc_id = aws_vpc.main.id
-  
+
   route {
     cidr_block     = "0.0.0.0/0"
-    nat_gateway_id = aws_nat_gateway.main[count.index].id
+    nat_gateway_id = aws_nat_gateway.main[0].id
   }
-  
+
   tags = {
-    Name = "${local.name_prefix}-private-rt-${count.index + 1}"
+    Name = "${local.name_prefix}-private-rt"
   }
 }
 
 # Route table associations
 resource "aws_route_table_association" "public" {
-  count = length(aws_subnet.public)
-  
+  count          = length(aws_subnet.public)
   subnet_id      = aws_subnet.public[count.index].id
   route_table_id = aws_route_table.public.id
 }
 
 resource "aws_route_table_association" "private" {
-  count = length(aws_subnet.private)
-  
+  count          = local.config.enable_nat_gateway ? length(aws_subnet.private) : 0
   subnet_id      = aws_subnet.private[count.index].id
-  route_table_id = aws_route_table.private[count.index % local.nat_gateway_count].id
+  route_table_id = aws_route_table.private[0].id
 }
 
-#------------------------------------------------------------------------------
-# Security Groups
-#------------------------------------------------------------------------------
+# ============================================================================
+# SECURITY GROUPS
+# ============================================================================
 
-# Application security group
-resource "aws_security_group" "app" {
-  name_prefix = "${local.name_prefix}-app"
+resource "aws_security_group" "aurora" {
+  name_prefix = "${local.name_prefix}-aurora-"
   vpc_id      = aws_vpc.main.id
-  description = "Security group for Atlas application servers"
-  
-  ingress {
-    description = "HTTPS"
+  description = "Security group for Aurora PostgreSQL cluster"
+
+  dynamic "ingress" {
+    for_each = local.aurora_ingress_rules
+    content {
+      description     = ingress.value.description
+      from_port       = ingress.value.from_port
+      to_port         = ingress.value.to_port
+      protocol        = ingress.value.protocol
+      security_groups = ingress.value.security_groups
+      cidr_blocks     = ingress.value.cidr_blocks
+      self            = lookup(ingress.value, "self", null)
+    }
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "All outbound traffic"
+  }
+
+  tags = {
+    Name = "${local.name_prefix}-aurora-sg"
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_security_group" "redshift" {
+  name_prefix = "${local.name_prefix}-redshift-"
+  vpc_id      = aws_vpc.main.id
+  description = "Security group for Redshift cluster"
+
+  dynamic "ingress" {
+    for_each = local.redshift_ingress_rules
+    content {
+      description     = ingress.value.description
+      from_port       = ingress.value.from_port
+      to_port         = ingress.value.to_port
+      protocol        = ingress.value.protocol
+      security_groups = ingress.value.security_groups
+      cidr_blocks     = ingress.value.cidr_blocks
+    }
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "All outbound traffic"
+  }
+
+  tags = {
+    Name = "${local.name_prefix}-redshift-sg"
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_security_group" "application" {
+  name_prefix = "${local.name_prefix}-app-"
+  vpc_id      = aws_vpc.main.id
+  description = "Security group for application services"
+
+  # Application ingress rules would go here
+  # (HTTP, HTTPS, etc. - depends on your application architecture)
+
+  egress {
     from_port   = 443
     to_port     = 443
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
+    description = "HTTPS outbound"
   }
-  
-  ingress {
-    description = "HTTP"
+
+  egress {
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
+    description = "HTTP outbound"
   }
-  
-  egress {
-    description = "All outbound traffic"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-  
+
   tags = {
     Name = "${local.name_prefix}-app-sg"
   }
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
-# Aurora PostgreSQL security group
-resource "aws_security_group" "aurora" {
-  name_prefix = "${local.name_prefix}-aurora"
-  vpc_id      = aws_vpc.main.id
-  description = "Security group for Aurora PostgreSQL cluster"
+# ============================================================================
+# KMS KEY FOR ENCRYPTION
+# ============================================================================
 
-  ingress {
-    description     = "PostgreSQL from application"
-    from_port       = 5432
-    to_port         = 5432
-    protocol        = "tcp"
-    security_groups = [aws_security_group.app.id]
-  }
-  
-  egress {
-    description = "All outbound traffic"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-  
+resource "aws_kms_key" "main" {
+  description             = "KMS key for ${var.project_name} ${var.environment} encryption"
+  deletion_window_in_days = 7
+
   tags = {
-    Name = "${local.name_prefix}-aurora-sg"
+    Name = "${local.name_prefix}-kms"
   }
 }
 
-# Redshift security group
-resource "aws_security_group" "redshift" {
-  name_prefix = "${local.name_prefix}-redshift"
-  vpc_id      = aws_vpc.main.id
-  description = "Security group for Redshift cluster"
-
-  ingress {
-    description     = "Redshift from application"
-    from_port       = 5439
-    to_port         = 5439
-    protocol        = "tcp"
-    security_groups = [aws_security_group.app.id]
-  }
-  
-  # Allow Aurora to connect for data transfers
-  ingress {
-    description     = "Redshift from Aurora"
-    from_port       = 5439
-    to_port         = 5439
-    protocol        = "tcp"
-    security_groups = [aws_security_group.aurora.id]
-  }
-  
-  egress {
-    description = "All outbound traffic"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-  
-  tags = {
-    Name = "${local.name_prefix}-redshift-sg"
-  }
+resource "aws_kms_alias" "main" {
+  name          = "alias/${local.name_prefix}"
+  target_key_id = aws_kms_key.main.key_id
 }
 
-#------------------------------------------------------------------------------
-# Database Subnet Groups
-#------------------------------------------------------------------------------
+# ============================================================================
+# AURORA POSTGRESQL CLUSTER
+# ============================================================================
+
+resource "random_password" "aurora_master_password" {
+  length  = 32
+  special = true
+}
 
 resource "aws_db_subnet_group" "aurora" {
   name       = "${local.name_prefix}-aurora-subnet-group"
   subnet_ids = aws_subnet.private[*].id
-  
+
   tags = {
     Name = "${local.name_prefix}-aurora-subnet-group"
   }
 }
 
+resource "aws_rds_cluster_parameter_group" "aurora" {
+  family = "aurora-postgresql15"
+  name   = "${local.name_prefix}-aurora-cluster-pg"
+
+  # EAV optimization parameters
+  parameter {
+    name  = "shared_preload_libraries"
+    value = "pg_stat_statements"
+  }
+
+  parameter {
+    name  = "max_connections"
+    value = "2000"
+  }
+
+  parameter {
+    name  = "work_mem"
+    value = "32768"  # 32MB
+  }
+
+  parameter {
+    name  = "maintenance_work_mem"
+    value = "1048576"  # 1GB
+  }
+
+  # Logical replication for Debezium
+  parameter {
+    name  = "wal_level"
+    value = "logical"
+  }
+
+  parameter {
+    name  = "max_replication_slots"
+    value = "10"
+  }
+
+  parameter {
+    name  = "max_wal_senders"
+    value = "10"
+  }
+}
+
+resource "aws_rds_cluster" "main" {
+  cluster_identifier     = "${local.name_prefix}-aurora"
+  engine                = "aurora-postgresql"
+  engine_version        = "15.4"
+  database_name         = replace(var.project_name, "-", "")
+  master_username       = "atlasco_admin"
+  master_password       = random_password.aurora_master_password.result
+
+  db_subnet_group_name            = aws_db_subnet_group.aurora.name
+  vpc_security_group_ids          = [aws_security_group.aurora.id]
+  db_cluster_parameter_group_name = aws_rds_cluster_parameter_group.aurora.name
+
+  backup_retention_period      = local.backup_retention_days
+  preferred_backup_window      = "03:00-04:00"
+  preferred_maintenance_window = "sun:04:00-sun:05:00"
+  
+  enabled_cloudwatch_logs_exports = ["postgresql"]
+  
+  serverlessv2_scaling_configuration {
+    max_capacity = local.config.aurora_max_capacity
+    min_capacity = local.config.aurora_min_capacity
+  }
+
+  storage_encrypted   = true
+  kms_key_id         = aws_kms_key.main.arn
+  deletion_protection = local.enable_deletion_protection
+  skip_final_snapshot = !local.enable_deletion_protection
+
+  tags = {
+    Name = "${local.name_prefix}-aurora"
+  }
+}
+
+resource "aws_rds_cluster_instance" "cluster_instances" {
+  count              = local.config.aurora_instance_count
+  identifier         = "${local.name_prefix}-aurora-${count.index}"
+  cluster_identifier = aws_rds_cluster.main.id
+  instance_class     = local.config.aurora_instance_class
+  engine             = aws_rds_cluster.main.engine
+  engine_version     = aws_rds_cluster.main.engine_version
+
+  performance_insights_enabled = local.config.enable_performance_insights
+  monitoring_interval         = local.config.enable_enhanced_monitoring ? 60 : 0
+
+  tags = {
+    Name = "${local.name_prefix}-aurora-${count.index}"
+  }
+}
+
+# ============================================================================
+# REDSHIFT CLUSTER
+# ============================================================================
+
+resource "random_password" "redshift_master_password" {
+  length  = 32
+  special = false  # Redshift doesn't support all special characters
+}
+
 resource "aws_redshift_subnet_group" "main" {
   name       = "${local.name_prefix}-redshift-subnet-group"
   subnet_ids = aws_subnet.private[*].id
-  
+
   tags = {
     Name = "${local.name_prefix}-redshift-subnet-group"
   }
 }
 
-#------------------------------------------------------------------------------
-# IAM Roles
-#------------------------------------------------------------------------------
-
-# IAM role for RDS enhanced monitoring
-resource "aws_iam_role" "rds_monitoring" {
-  name = "${local.name_prefix}-rds-monitoring-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "monitoring.rds.amazonaws.com"
-        }
-      }
-    ]
-  })
-  
-  tags = {
-    Name = "${local.name_prefix}-rds-monitoring-role"
-  }
-}
-
-resource "aws_iam_role_policy_attachment" "rds_monitoring" {
-  role       = aws_iam_role.rds_monitoring.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
-}
-
-#------------------------------------------------------------------------------
-# Aurora PostgreSQL Cluster
-#------------------------------------------------------------------------------
-
-resource "aws_rds_cluster" "aurora" {
-  cluster_identifier     = "${local.name_prefix}-aurora"
-  engine                = "aurora-postgresql"
-  engine_version        = var.aurora_engine_version
-  database_name         = var.database_name
-  master_username       = var.database_username
-  manage_master_user_password = true
-  
-  # Network configuration
-  vpc_security_group_ids = [aws_security_group.aurora.id]
-  db_subnet_group_name   = aws_db_subnet_group.aurora.name
-  
-  # Backup and maintenance
-  backup_retention_period   = var.backup_retention_days
-  preferred_backup_window   = var.backup_window
-  preferred_maintenance_window = var.maintenance_window
-  
-  # Performance and monitoring
-  enabled_cloudwatch_logs_exports = ["postgresql"]
-  storage_encrypted              = true
-  deletion_protection           = var.enable_deletion_protection
-  
-  # Serverless v2 scaling
-  serverlessv2_scaling_configuration {
-    max_capacity = var.aurora_max_capacity
-    min_capacity = var.aurora_min_capacity
-  }
-  
-  tags = {
-    Name = "${local.name_prefix}-aurora-cluster"
-    Type = "oltp"
-  }
-}
-
-# Aurora cluster instances
-resource "aws_rds_cluster_instance" "aurora" {
-  count              = var.aurora_instance_count
-  identifier         = "${local.name_prefix}-aurora-${count.index}"
-  cluster_identifier = aws_rds_cluster.aurora.id
-  instance_class     = var.aurora_instance_class
-  engine             = aws_rds_cluster.aurora.engine
-  engine_version     = aws_rds_cluster.aurora.engine_version
-  
-  # Performance monitoring
-  performance_insights_enabled = var.enable_performance_insights
-  performance_insights_retention_period = var.performance_insights_retention
-  monitoring_interval         = var.monitoring_interval
-  monitoring_role_arn        = var.monitoring_interval > 0 ? aws_iam_role.rds_monitoring.arn : null
-  
-  # Instance role (first is writer, rest are readers)
-  promotion_tier = count.index == 0 ? 0 : 1
-  
-  tags = {
-    Name = "${local.name_prefix}-aurora-${count.index}"
-    Role = count.index == 0 ? "writer" : "reader"
-  }
-}
-
-#------------------------------------------------------------------------------
-# Redshift Cluster
-#------------------------------------------------------------------------------
-
 resource "aws_redshift_cluster" "main" {
-  cluster_identifier        = "${local.name_prefix}-redshift"
-  database_name            = var.redshift_database_name
-  master_username          = var.redshift_username
-  manage_master_password   = true
-  node_type                = var.redshift_node_type
-  number_of_nodes          = var.redshift_node_count > 1 ? var.redshift_node_count : null
+  cluster_identifier = "${local.name_prefix}-redshift"
   
-  # Network configuration
-  vpc_security_group_ids    = [aws_security_group.redshift.id]
+  database_name   = replace(var.project_name, "-", "")
+  master_username = "atlasco_analytics"
+  master_password = random_password.redshift_master_password.result
+  
+  node_type       = local.config.redshift_node_type
+  number_of_nodes = local.config.redshift_cluster_nodes
+  
   cluster_subnet_group_name = aws_redshift_subnet_group.main.name
-  publicly_accessible      = false
+  vpc_security_group_ids    = [aws_security_group.redshift.id]
+  publicly_accessible       = false
   
-  # Security and compliance
-  encrypted                = true
-  enhanced_vpc_routing     = true
-  skip_final_snapshot     = !var.enable_final_snapshot
-  final_snapshot_identifier = var.enable_final_snapshot ? "${local.name_prefix}-redshift-final-${formatdate("YYYY-MM-DD-hhmm", timestamp())}" : null
+  encrypted  = true
+  kms_key_id = aws_kms_key.main.arn
   
-  # Maintenance and backup
-  preferred_maintenance_window = var.redshift_maintenance_window
-  automated_snapshot_retention_period = var.redshift_snapshot_retention
+  automated_snapshot_retention_period = local.backup_retention_days
+  preferred_maintenance_window         = "sun:05:00-sun:06:00"
   
+  skip_final_snapshot = !local.enable_deletion_protection
+
   tags = {
-    Name = "${local.name_prefix}-redshift-cluster"
-    Type = "olap"
+    Name = "${local.name_prefix}-redshift"
   }
 }
