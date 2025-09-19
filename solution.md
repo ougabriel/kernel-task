@@ -27,7 +27,7 @@ Please [CLICK HERE](https://github.com/ougabriel/kernel-task/blob/main/schema.sq
 
 * **`attr_type`** → small, reference table (hundreds or thousands of rows). No partitioning needed.
 * **`entity`** → very large (200M+ rows), must be partitioned/sharded carefully.
-* **`entity_attribute`** → *fact-like* table, extremely wide in terms of rows (billions+ possible). Needs the most careful design.
+* **`entity_attribute`** → *fact-like* table, extremely wide in terms of rows (billions+ possible).
 
 ---
 
