@@ -120,7 +120,7 @@ f. Benefits of this Strategy
   * `attr_type` → replicated.
 
 ---
-##Keeping queries fast at 200M entities
+## Keeping queries fast at 200M entities
 
 a. First we'd want to know my query patterns(first, always)
    finding entities where `attribute_id = x` and `value_text` = `y1 
@@ -261,7 +261,7 @@ Indexes: (attribute_id, value_number) and (attribute_id, value_text) speed up at
 -  The analytical query shows we can aggregate attributes across entities for distribution/statistics
 
 
-##4. Trade-Offs Summary
+## 4. Trade-Offs Summary
  Where this design excels includes the following
    i. Flexibility: We can add new attributes without schema changes; also good for metadata-driven or dynamic domains 
    ii. Sparse storage efficiency: Only store values for attributes that exist (vs. wide nullable columns).
@@ -685,8 +685,9 @@ Example Usage of the `terraform` script.
    terraform apply -var="environment=prod"
 ```
 
-##Additional Example using Modules
-In this example I will attempt to restructure the Terraform setup into **reusable modules** — this is the recommended approach for production-ready IaC.
+## Additional Example using Modules:
+
+In this example I will attempt to restructure the Terraform setup into **reusable modules**; this will be my recommended approach for production-ready IaC.
 
 ---
 
