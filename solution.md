@@ -1,17 +1,7 @@
 # Kernel Take-Home Complete Guide: EAV at Scale
 Complete Dirs Structure
-kernel-task/
-├── solution.md
-├── schema.sql
-├── infras/terraform
-│   ├── variables.tf      # Input variables and validation
-│   ├── locals.tf         # Computed values and environment configs
-│   ├── provider.tf       # Terraform and AWS provider configuration
-│   ├── main.tf           # Core infrastructure resources
-│   ├── outputs.tf        # Output values for other modules/scripts
-│   ├── terraform.tfvars.example  # Example variable values
-│   └── README.md         # Infrastructure documentation
-└── notes.md
+<img width="554" height="249" alt="image" src="https://github.com/user-attachments/assets/69ca5a9b-8b63-406b-8bdb-a1ade87f1e1a" />
+
 
 ## Part A: Data Model & Querying
 
